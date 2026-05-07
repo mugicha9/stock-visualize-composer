@@ -11,10 +11,10 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
-from ..database import utc_now
 from .content_summaries import fetch_article_text
 from .information_dates import infer_information_date
 from .news_policy import canonical_news_url
+from .source_events import list_global_events, record_event_triage, upsert_source_event
 
 
 class GlobalNewsSourceError(RuntimeError):
@@ -85,7 +85,6 @@ GLOBAL_KEYWORDS = [
 
 
 def update_global_news(conn: sqlite3.Connection, *, limit_per_source: int = 40, fetch_body: bool = False) -> dict[str, Any]:
-    now = utc_now()
     inserted_or_updated = 0
     skipped = 0
     errors: dict[str, str] = {}
@@ -103,35 +102,31 @@ def update_global_news(conn: sqlite3.Connection, *, limit_per_source: int = 40, 
             content_text = item.get("summary")
             if fetch_body:
                 content_text = fetch_article_text(url) or content_text
-            conn.execute(
-                """
-                INSERT INTO global_news
-                    (category, title, published_at, information_date, source, provider, url, content_text,
-                     summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, url) DO UPDATE SET
-                    category = excluded.category,
-                    title = excluded.title,
-                    published_at = excluded.published_at,
-                    information_date = excluded.information_date,
-                    provider = excluded.provider,
-                    content_text = COALESCE(excluded.content_text, global_news.content_text),
-                    summary = COALESCE(global_news.summary, excluded.summary),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    item["category"],
-                    item["title"],
-                    item["published_at"],
-                    infer_information_date(title=item["title"], published_at=item["published_at"], url=url),
-                    item["source"],
-                    item["provider"],
-                    url,
-                    content_text,
-                    item.get("summary"),
-                    now,
-                    now,
-                ),
+            information_date = infer_information_date(title=item["title"], published_at=item["published_at"], url=url)
+            event = upsert_source_event(
+                conn,
+                scope="global",
+                event_type="global_news",
+                title=item["title"],
+                information_date=information_date,
+                published_at=item["published_at"],
+                source=item["source"],
+                provider=item["provider"],
+                url=url,
+                content_text=content_text,
+                metadata={"category": item["category"], "summary": item.get("summary")},
+                raw_payload=item,
+            )
+            record_event_triage(
+                conn,
+                source_event_id=int(event["id"]),
+                company_id=None,
+                action="summarize" if fetch_body or item.get("summary") else "title_only",
+                relevance_score=0.7,
+                materiality_score=0.7,
+                reason="全体ニュースとして共有保存",
+                model_name="rule",
+                prompt_version="global_news_policy_v2",
             )
             inserted_or_updated += 1
     if errors and inserted_or_updated == 0:
@@ -140,25 +135,25 @@ def update_global_news(conn: sqlite3.Connection, *, limit_per_source: int = 40, 
 
 
 def list_global_news(conn: sqlite3.Connection, *, limit: int = 50, as_of: str | None = None) -> list[dict[str, Any]]:
-    params: list[Any] = []
-    date_expr = "COALESCE(information_date, substr(published_at, 1, 10))"
-    date_filter = ""
-    if as_of:
-        date_filter = f"WHERE {date_expr} IS NOT NULL AND {date_expr} <= ?"
-        params.append(as_of)
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT id, category, title, published_at, {date_expr} AS information_date,
-               source, provider, url, content_text, summary
-        FROM global_news
-        {date_filter}
-        ORDER BY {date_expr} DESC, id DESC
-        LIMIT ?
-        """,
-        params,
-    ).fetchall()
-    return [dict(row) for row in rows]
+    events = list_global_events(conn, limit=limit, as_of=as_of)
+    return [
+        {
+            "id": event["id"],
+            "source_event_id": event["id"],
+            "category": (event.get("metadata") or {}).get("category"),
+            "title": event.get("title"),
+            "published_at": event.get("published_at"),
+            "information_date": event.get("information_date"),
+            "source": event.get("source"),
+            "provider": event.get("provider"),
+            "url": event.get("url"),
+            "content_text": event.get("content_text"),
+            "summary": event.get("summary"),
+            "relevance_score": event.get("relevance_score"),
+            "selection_reason": event.get("selection_reason"),
+        }
+        for event in events
+    ]
 
 
 def _fetch_feed(source: FeedSource) -> list[dict[str, Any]]:

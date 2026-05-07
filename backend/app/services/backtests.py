@@ -12,6 +12,7 @@ from .features import build_llm_input
 from .global_news import update_global_news
 from .information_dates import ensure_information_date_columns, infer_information_date, refresh_information_dates
 from .llm import provider_from_settings, validate_judgement_output
+from .source_events import source_event_counts
 
 
 ENTRY_ACTIONS = {"BUY", "WATCH_BUY"}
@@ -158,9 +159,9 @@ def run_backtest(conn: sqlite3.Connection, request: BacktestRequest) -> dict[str
         "equity_curve": equity_curve,
         "errors": errors,
         "leakage_guard": {
-            "as_of_filter": "判断入力は price_bars / technical_indicators / disclosures / company_news / financials / global_news を判断日以下で取得します。",
+            "as_of_filter": "判断入力は price_bars / technical_indicators / source_events / company_financials を判断日以下で取得します。",
             "execution_timing": "判断は判断日終値までの情報で作り、売買は次の取引日の始値で約定させます。",
-            "storage": "バックテスト中のAI判断は ai_judgements には保存しません。",
+            "storage": "バックテスト中のContext Packetはメモリ上で生成し、売買判断履歴はバックテスト結果に保持します。",
         },
     }
 
@@ -193,7 +194,7 @@ def fetch_backtest_period_info(conn: sqlite3.Connection, request: BacktestPeriod
 
     if request.persist:
         if request.include_news:
-            fetched["news_articles"] = len(update_news_for_company(conn, request.security_code, limit=request.news_limit))
+            fetched["company_news"] = len(update_news_for_company(conn, request.security_code, limit=request.news_limit))
         if request.include_disclosures:
             fetched["disclosures"] = len(update_disclosures_for_company(conn, request.security_code, limit=request.disclosure_limit))
         if request.include_external_factors:
@@ -265,10 +266,27 @@ def _price_rows(conn: sqlite3.Connection, company_id: int, start_date: str, end_
 
 
 def _period_coverage(conn: sqlite3.Connection, company_id: int, start_date: str, end_date: str) -> dict[str, Any]:
+    event_counts = source_event_counts(conn, company_id=company_id, start_date=start_date, end_date=end_date)
     return {
-        "news_articles": _table_period_count(conn, "news_articles", company_id, start_date, end_date),
-        "disclosures": _table_period_count(conn, "disclosures", company_id, start_date, end_date),
-        "global_news": _global_period_count(conn, start_date, end_date),
+        "source_events": event_counts,
+        "company_news": {
+            "available": event_counts["company_news"],
+            "earliest_date": event_counts["earliest_date"],
+            "latest_date": event_counts["latest_date"],
+            "missing_information_date": event_counts["missing_information_date"],
+        },
+        "disclosures": {
+            "available": event_counts["disclosures"],
+            "earliest_date": event_counts["earliest_date"],
+            "latest_date": event_counts["latest_date"],
+            "missing_information_date": event_counts["missing_information_date"],
+        },
+        "global_news": {
+            "available": event_counts["global_news"],
+            "earliest_date": event_counts["earliest_date"],
+            "latest_date": event_counts["latest_date"],
+            "missing_information_date": event_counts["missing_information_date"],
+        },
         "company_financials": _financial_period_count(conn, company_id, start_date, end_date),
     }
 
@@ -364,7 +382,7 @@ def _preview_period_info(request: BacktestPeriodInfoRequest, start_date: str, en
     source_notes: list[str] = []
     if request.include_news:
         items = source.fetch_news(request.security_code, limit=request.news_limit)
-        fetched["news_articles"] = _preview_count(items, start_date, end_date)
+        fetched["company_news"] = _preview_count(items, start_date, end_date)
     if request.include_disclosures:
         items = source.fetch_disclosures(request.security_code, limit=request.disclosure_limit)
         fetched["disclosures"] = _preview_count(items, start_date, end_date)
@@ -495,6 +513,7 @@ def _fallback_output(message: str) -> dict[str, Any]:
         "entry_conditions": ["判断生成が正常に完了するまで新規買いを見送ります。"],
         "exit_conditions": ["判断生成が正常に完了するまで既存方針を維持します。"],
         "risk_notes": ["このステップはバックテスト結果の誤差要因になります。"],
+        "used_signal_ids": [],
     }
 
 

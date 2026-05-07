@@ -9,6 +9,7 @@ from ..database import utc_now
 from ..deps import get_db
 from ..models import DisclosureCreate
 from ..services.information_dates import infer_information_date
+from ..services.source_events import list_company_events, record_event_triage, upsert_event_summary, upsert_source_event
 
 
 router = APIRouter(prefix="/companies/{security_code}/disclosures", tags=["disclosures"])
@@ -21,17 +22,7 @@ def list_disclosures(
     conn: sqlite3.Connection = Depends(get_db),
 ) -> list[dict[str, Any]]:
     company_id = _company_id(conn, security_code)
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM disclosures
-        WHERE company_id = ?
-        ORDER BY COALESCE(information_date, substr(published_at, 1, 10)) DESC, id DESC
-        LIMIT ?
-        """,
-        (company_id, limit),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return [_disclosure_item(event) for event in list_company_events(conn, company_id, event_types={"disclosure"}, limit=limit)]
 
 
 @router.post("")
@@ -42,34 +33,51 @@ def create_disclosure(
 ) -> dict[str, Any]:
     company_id = _company_id(conn, security_code)
     now = utc_now()
-    cur = conn.execute(
-        """
-        INSERT INTO disclosures
-            (company_id, title, document_type, published_at, information_date, source, url, local_path,
-             summary, importance_score, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
-        """,
-        (
-            company_id,
-            payload.title,
-            payload.document_type,
-            payload.published_at,
-            infer_information_date(
-                title=payload.title,
-                published_at=payload.published_at,
-                url=payload.url,
-                created_at=now,
-            ),
-            payload.source,
-            payload.url,
-            payload.summary,
-            payload.importance_score,
-            now,
-            now,
-        ),
+    information_date = infer_information_date(
+        title=payload.title,
+        published_at=payload.published_at,
+        url=payload.url,
+        created_at=now,
     )
-    row = conn.execute("SELECT * FROM disclosures WHERE id = ?", (cur.lastrowid,)).fetchone()
-    return dict(row)
+    event = upsert_source_event(
+        conn,
+        scope="company",
+        event_type="disclosure",
+        company_id=company_id,
+        title=payload.title,
+        information_date=information_date,
+        published_at=payload.published_at,
+        source=payload.source,
+        provider="manual",
+        url=payload.url,
+        metadata={
+            "document_type": payload.document_type,
+            "summary": payload.summary,
+            "importance_score": payload.importance_score,
+        },
+        raw_payload=payload.model_dump(),
+    )
+    record_event_triage(
+        conn,
+        source_event_id=int(event["id"]),
+        company_id=company_id,
+        action="must_include",
+        relevance_score=payload.importance_score,
+        materiality_score=payload.importance_score,
+        reason="手動登録された開示",
+        model_name="manual",
+        prompt_version="manual",
+    )
+    if payload.summary:
+        upsert_event_summary(
+            conn,
+            source_event_id=int(event["id"]),
+            company_id=company_id,
+            summary_text=payload.summary,
+            summary_type="manual",
+            model_name="manual",
+        )
+    return _disclosure_item(event)
 
 
 def _company_id(conn: sqlite3.Connection, security_code: str) -> int:
@@ -80,3 +88,19 @@ def _company_id(conn: sqlite3.Connection, security_code: str) -> int:
     if row is None:
         raise HTTPException(status_code=404, detail="Company not found")
     return int(row["id"])
+
+
+def _disclosure_item(event: dict[str, Any]) -> dict[str, Any]:
+    metadata = event.get("metadata") or {}
+    return {
+        "id": event["id"],
+        "source_event_id": event["id"],
+        "title": event.get("title"),
+        "document_type": metadata.get("document_type"),
+        "published_at": event.get("published_at"),
+        "information_date": event.get("information_date"),
+        "source": event.get("source"),
+        "url": event.get("url"),
+        "summary": event.get("summary"),
+        "importance_score": metadata.get("importance_score"),
+    }

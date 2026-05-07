@@ -17,6 +17,7 @@ from ..services.company_sources import (
 )
 from ..services.judgements import latest_judgement_for_company
 from ..services.price_sources import PriceSourceError, update_prices_for_company
+from ..services.source_events import list_company_events
 
 
 router = APIRouter(prefix="/watchlist", tags=["watchlist"])
@@ -187,15 +188,20 @@ def _latest_indicator(conn: sqlite3.Connection, company_id: int) -> dict[str, An
 
 
 def _latest_disclosure(conn: sqlite3.Connection, company_id: int) -> dict[str, Any] | None:
-    return row_to_dict(
-        conn.execute(
-            """
-            SELECT id, title, document_type, published_at, information_date, source, url, summary, importance_score
-            FROM disclosures
-            WHERE company_id = ?
-            ORDER BY COALESCE(information_date, substr(published_at, 1, 10)) DESC, id DESC
-            LIMIT 1
-            """,
-            (company_id,),
-        ).fetchone()
-    )
+    events = list_company_events(conn, company_id, event_types={"disclosure"}, limit=1)
+    if not events:
+        return None
+    event = events[0]
+    metadata = event.get("metadata") or {}
+    return {
+        "id": event["id"],
+        "source_event_id": event["id"],
+        "title": event.get("title"),
+        "document_type": metadata.get("document_type"),
+        "published_at": event.get("published_at"),
+        "information_date": event.get("information_date"),
+        "source": event.get("source"),
+        "url": event.get("url"),
+        "summary": event.get("summary"),
+        "importance_score": metadata.get("importance_score"),
+    }

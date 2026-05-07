@@ -6,8 +6,13 @@ from ..database import db_session, utc_now, write_update_log
 
 
 VOLATILE_TABLES = [
+    "judgement_signal_links",
     "signal_cards",
     "ai_judgements",
+    "context_packets",
+    "event_summaries",
+    "event_triage",
+    "source_events",
     "technical_indicators",
     "price_bars",
     "disclosures",

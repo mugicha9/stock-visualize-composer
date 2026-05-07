@@ -209,6 +209,76 @@ CREATE TABLE IF NOT EXISTS external_factors (
 CREATE INDEX IF NOT EXISTS idx_external_factors_company_published_at
 ON external_factors(company_id, published_at);
 
+CREATE TABLE IF NOT EXISTS source_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key TEXT NOT NULL UNIQUE,
+    scope TEXT NOT NULL,
+    company_id INTEGER,
+    event_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    information_date TEXT,
+    published_at TEXT,
+    source TEXT,
+    provider TEXT,
+    url TEXT,
+    content_text TEXT,
+    content_hash TEXT,
+    metadata_json TEXT,
+    raw_payload_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_events_company_type_date
+ON source_events(company_id, event_type, information_date);
+
+CREATE INDEX IF NOT EXISTS idx_source_events_scope_type_date
+ON source_events(scope, event_type, information_date);
+
+CREATE TABLE IF NOT EXISTS event_triage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    triage_key TEXT NOT NULL UNIQUE,
+    source_event_id INTEGER NOT NULL,
+    company_id INTEGER,
+    action TEXT NOT NULL,
+    relevance_score REAL,
+    materiality_score REAL,
+    reason TEXT,
+    model_name TEXT,
+    prompt_version TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (source_event_id) REFERENCES source_events(id),
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_triage_event_company
+ON event_triage(source_event_id, company_id);
+
+CREATE TABLE IF NOT EXISTS event_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary_key TEXT NOT NULL UNIQUE,
+    source_event_id INTEGER NOT NULL,
+    company_id INTEGER,
+    summary_type TEXT NOT NULL,
+    prompt_version TEXT,
+    model_name TEXT,
+    language TEXT NOT NULL DEFAULT 'ja',
+    summary_text TEXT NOT NULL,
+    structured_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (source_event_id) REFERENCES source_events(id),
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_summaries_event_company
+ON event_summaries(source_event_id, company_id, summary_type);
+
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id INTEGER,
@@ -240,6 +310,24 @@ CREATE TABLE IF NOT EXISTS ai_prompt_templates (
     UNIQUE(name, version)
 );
 
+CREATE TABLE IF NOT EXISTS context_packets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_id INTEGER NOT NULL,
+    judgement_type TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    build_version TEXT NOT NULL,
+    packet_json TEXT NOT NULL,
+    included_signal_ids_json TEXT,
+    excluded_signal_ids_json TEXT,
+    token_estimate INTEGER,
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_packets_company_as_of
+ON context_packets(company_id, as_of, created_at);
+
 CREATE TABLE IF NOT EXISTS ai_judgements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id INTEGER NOT NULL,
@@ -254,6 +342,7 @@ CREATE TABLE IF NOT EXISTS ai_judgements (
     output_json TEXT NOT NULL,
 
     prompt_template_id INTEGER,
+    context_packet_id INTEGER,
     model_provider TEXT NOT NULL DEFAULT 'llama_cpp',
     model_name TEXT,
     model_options_json TEXT,
@@ -262,7 +351,8 @@ CREATE TABLE IF NOT EXISTS ai_judgements (
     created_at TEXT NOT NULL,
 
     FOREIGN KEY (company_id) REFERENCES companies(id),
-    FOREIGN KEY (prompt_template_id) REFERENCES ai_prompt_templates(id)
+    FOREIGN KEY (prompt_template_id) REFERENCES ai_prompt_templates(id),
+    FOREIGN KEY (context_packet_id) REFERENCES context_packets(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_judgements_company_target_date
@@ -274,9 +364,14 @@ ON ai_judgements(action);
 CREATE TABLE IF NOT EXISTS signal_cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     company_id INTEGER NOT NULL,
+    context_packet_id INTEGER,
+    judgement_id INTEGER,
+
+    signal_id TEXT NOT NULL,
 
     source_type TEXT NOT NULL,
     source_id INTEGER,
+    source_event_id INTEGER,
     source_name TEXT,
 
     horizon TEXT NOT NULL,
@@ -290,16 +385,44 @@ CREATE TABLE IF NOT EXISTS signal_cards (
     summary TEXT NOT NULL,
     evidence_json TEXT,
     risk_notes_json TEXT,
+    payload_json TEXT,
 
     valid_from TEXT,
     valid_until TEXT,
     created_at TEXT NOT NULL,
 
-    FOREIGN KEY (company_id) REFERENCES companies(id)
+    FOREIGN KEY (company_id) REFERENCES companies(id),
+    FOREIGN KEY (source_event_id) REFERENCES source_events(id),
+    FOREIGN KEY (context_packet_id) REFERENCES context_packets(id),
+    FOREIGN KEY (judgement_id) REFERENCES ai_judgements(id),
+    UNIQUE(context_packet_id, signal_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_signal_cards_company_horizon_created
 ON signal_cards(company_id, horizon, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_signal_cards_context_packet
+ON signal_cards(context_packet_id);
+
+CREATE INDEX IF NOT EXISTS idx_signal_cards_source_event
+ON signal_cards(source_event_id);
+
+CREATE TABLE IF NOT EXISTS judgement_signal_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    judgement_id INTEGER NOT NULL,
+    signal_card_id INTEGER NOT NULL,
+    signal_id TEXT NOT NULL,
+    usage_type TEXT NOT NULL,
+    reason TEXT,
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (judgement_id) REFERENCES ai_judgements(id),
+    FOREIGN KEY (signal_card_id) REFERENCES signal_cards(id),
+    UNIQUE(judgement_id, signal_id, usage_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_judgement_signal_links_judgement
+ON judgement_signal_links(judgement_id);
 
 CREATE TABLE IF NOT EXISTS data_update_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

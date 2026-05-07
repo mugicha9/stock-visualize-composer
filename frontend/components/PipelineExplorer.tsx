@@ -27,8 +27,8 @@ const CURRENT_STEPS: PipelineStep[] = [
     id: "fetch-company",
     title: "企業取得",
     input: "銘柄コード",
-    process: "株価、会社情報、決算スナップショット、適時開示、企業ニュースを取得します。企業ニュースは会社別キーワードで保存前に絞り込みます。",
-    output: "price_bars / company_financials / disclosures / news_articles / company_news_profiles",
+    process: "株価、会社情報、決算スナップショット、適時開示、企業ニュースを取得します。企業ニュースと開示はsource_eventsへ正規化します。",
+    output: "price_bars / company_financials / source_events / event_triage / company_news_profiles",
     settings: [
       "company_news_fetch_limit",
       "company_news_keyword_profile_enabled",
@@ -41,8 +41,8 @@ const CURRENT_STEPS: PipelineStep[] = [
     id: "fetch-global",
     title: "全体取得",
     input: "公式RSS",
-    process: "経済、政策、金融、地政学ニュースを共有テーブルへ保存します。",
-    output: "global_news",
+    process: "経済、政策、金融、地政学ニュースを共有イベントとしてsource_eventsへ保存します。",
+    output: "source_events(scope=global)",
     settings: ["global_news_fetch_limit_per_source"]
   },
   {
@@ -57,11 +57,14 @@ const CURRENT_STEPS: PipelineStep[] = [
     id: "rank-news",
     title: "ニュース選別",
     input: "企業ニュースと全体ニュースのタイトル",
-    process: "対象企業にとって重要な記事をLLMまたはキーワードで選びます。",
-    output: "selected_company_news / selected_global_news",
+    process: "対象企業にとって重要な記事をLLMまたはキーワードで選び、event_triageへ保存します。",
+    output: "event_triage / selected_company_news / selected_global_news",
     settings: [
       "llm_news_selection_max_company",
       "llm_news_selection_max_global",
+      "historical_news_lookback_days",
+      "historical_important_events_limit",
+      "historical_global_events_limit",
       "llama_cpp_model_name",
       "prompt_news_relevance_system",
       "prompt_news_relevance_policy"
@@ -71,15 +74,30 @@ const CURRENT_STEPS: PipelineStep[] = [
     id: "summarize",
     title: "本文要約",
     input: "選別済み記事の本文またはURL",
-    process: "必要な記事だけ本文取得と要約を行い、コンテキストを圧縮します。",
-    output: "summary",
+    process: "必要な記事だけ本文取得と要約を行い、event_summariesへ保存してコンテキストを圧縮します。",
+    output: "event_summaries",
     settings: ["news_summary_max_items", "news_summary_timeout_seconds", "prompt_news_summary_system", "prompt_news_summary_task"]
+  },
+  {
+    id: "material-assessment",
+    title: "材料評価",
+    input: "要約済みニュース、開示、全体ニュース、企業プロフィール",
+    process: "対象企業の主力事業、財務、需要先、外部環境に照らし、LLMが方向性・重要度・関連度を評価します。辞書スコアはLLM不可時の弱い補助に限定します。",
+    output: "material_assessment",
+    settings: [
+      "material_assessment_enabled",
+      "material_assessment_batch_size",
+      "material_assessment_max_items",
+      "material_assessment_timeout_seconds",
+      "prompt_material_assessment_system",
+      "prompt_material_assessment_task"
+    ]
   },
   {
     id: "signals",
     title: "Signal Card",
-    input: "必須情報、選別ニュース、テクニカル特徴量",
-    process: "technical / fundamental / news / market の材料を方向・影響度・鮮度に変換します。",
+    input: "必須情報、材料評価、テクニカル特徴量",
+    process: "technical / fundamental / news / market の材料をSignal Cardへ変換します。ニュース方向性は材料評価を優先します。",
     output: "signal_cards",
     settings: []
   },
@@ -87,9 +105,9 @@ const CURRENT_STEPS: PipelineStep[] = [
     id: "packet",
     title: "Context Packet",
     input: "Signal Card",
-    process: "LLMへ渡す最小コンテキストへ集約します。",
-    output: "context_packet",
-    settings: ["llama_cpp_context_length"]
+    process: "LLMへ渡す最小コンテキストへ集約し、保存件数の上限内でDBに残します。",
+    output: "context_packets / signal_cards",
+    settings: ["llama_cpp_context_length", "context_packet_retention_per_company"]
   },
   {
     id: "judgement",
@@ -105,6 +123,7 @@ const CURRENT_STEPS: PipelineStep[] = [
       "llama_cpp_top_k",
       "llm_judgement_max_attempts",
       "llm_grounding_auto_repair_enabled",
+      "context_packet_retention_per_company",
       "prompt_final_judgement_user_instruction",
       "prompt_final_judgement_repair_instruction"
     ]
@@ -186,13 +205,13 @@ const PROPOSED_STEPS: PipelineStep[] = [
 
 const MODES = {
   current: {
-    label: "現行",
-    description: "現在の実装は、判断時に保存済み入力からSignal CardとContext Packetを生成してLLMへ渡します。",
+    label: "v2実装",
+    description: "現在の実装は、source_eventsを入口に、triage、summary、Signal Card、Context Packet、AI判断を追跡します。",
     steps: CURRENT_STEPS
   },
   proposal: {
-    label: "提案 v2",
-    description: "提案仕様では、情報、要約、Signal Card、Context Packetを永続化し、判断根拠を完全に監査できる形へ寄せます。",
+    label: "次期拡張",
+    description: "次期拡張では、バックテストのPacket永続化と評価履歴を追加します。",
     steps: PROPOSED_STEPS
   }
 } as const;
@@ -218,10 +237,10 @@ export function PipelineExplorer() {
           </div>
           <div className="segmented pipeline-mode">
             <button className={mode === "current" ? "active" : undefined} type="button" onClick={() => selectMode("current")}>
-              現行
+              v2実装
             </button>
             <button className={mode === "proposal" ? "active" : undefined} type="button" onClick={() => selectMode("proposal")}>
-              提案 v2
+              次期拡張
             </button>
           </div>
         </div>

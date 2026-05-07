@@ -17,6 +17,7 @@ from .content_summaries import fetch_article_text, summarize_news_item
 from .documents import DocumentExtractionError, process_disclosure_pdf
 from .information_dates import infer_information_date
 from .news_policy import canonical_news_url, decide_company_news
+from .source_events import list_company_events, record_event_triage, upsert_event_summary, upsert_source_event
 
 
 JST = timezone(timedelta(hours=9))
@@ -247,7 +248,6 @@ def update_news_for_company(
     min_score = float(get_setting(conn, "company_news_relevance_min_score", "0.35") or "0.35")
     max_summary_items = int(get_setting(conn, "news_summary_max_items", "12") or "12")
     should_summarize = _truthy(get_setting(conn, "news_summary_on_update", "0")) if summarize is None else summarize
-    now = utc_now()
     saved = 0
     summarized = 0
     for item in items:
@@ -262,41 +262,48 @@ def update_news_for_company(
             summarized += 1
         else:
             item["summary"] = None
-        conn.execute(
-            """
-            INSERT INTO news_articles
-                (company_id, title, published_at, information_date, source, provider, url, content_text, summary,
-                 relevance_score, selection_reason, keyword_hits, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(company_id, source, url) DO UPDATE SET
-                title = excluded.title,
-                published_at = excluded.published_at,
-                information_date = excluded.information_date,
-                provider = excluded.provider,
-                content_text = COALESCE(excluded.content_text, news_articles.content_text),
-                summary = COALESCE(excluded.summary, news_articles.summary),
-                relevance_score = excluded.relevance_score,
-                selection_reason = excluded.selection_reason,
-                keyword_hits = excluded.keyword_hits,
-                updated_at = excluded.updated_at
-            """,
-            (
-                company["id"],
-                item["title"],
-                item["published_at"],
-                item["information_date"],
-                item["source"],
-                item["provider"],
-                item["url"],
-                item.get("content_text"),
-                item["summary"],
-                relevance["score"],
-                relevance["reason"],
-                json.dumps(relevance["keyword_hits"], ensure_ascii=False),
-                now,
-                now,
-            ),
+        event = upsert_source_event(
+            conn,
+            scope="company",
+            event_type="company_news",
+            company_id=int(company["id"]),
+            title=item["title"],
+            information_date=item["information_date"],
+            published_at=item["published_at"],
+            source=item["source"],
+            provider=item["provider"],
+            url=item["url"],
+            content_text=item.get("content_text"),
+            metadata={
+                "provider": item.get("provider"),
+                "relevance_score": relevance["score"],
+                "selection_reason": relevance["reason"],
+                "keyword_hits": relevance["keyword_hits"],
+                "policy_action": decision.action,
+                "policy_reason": decision.reason,
+            },
+            raw_payload=item,
         )
+        record_event_triage(
+            conn,
+            source_event_id=int(event["id"]),
+            company_id=int(company["id"]),
+            action=decision.action,
+            relevance_score=float(relevance["score"]),
+            materiality_score=float(relevance["score"]),
+            reason=relevance["reason"],
+            model_name="rule",
+            prompt_version=decision.reason,
+        )
+        if item.get("summary"):
+            upsert_event_summary(
+                conn,
+                source_event_id=int(event["id"]),
+                company_id=int(company["id"]),
+                summary_text=item["summary"],
+                summary_type="llm_compressed",
+                model_name=get_setting(conn, "news_summary_provider", "llama_cpp") or "llama_cpp",
+            )
         saved += 1
         if saved >= selected_limit:
             break
@@ -310,63 +317,61 @@ def _truthy(value: object) -> bool:
 def update_disclosures_for_company(conn: sqlite3.Connection, security_code: str, limit: int = 40) -> list[dict[str, Any]]:
     company = _company(conn, security_code)
     items = YahooJapanFinanceSource().fetch_disclosures(security_code, limit=limit)
-    now = utc_now()
     extract_enabled = _truthy(get_setting(conn, "disclosure_pdf_extract_on_update", "1"))
     extract_limit = int(get_setting(conn, "disclosure_pdf_extract_limit", "3") or "3")
     extracted = 0
     for item in items:
-        existing = conn.execute(
-            "SELECT id FROM disclosures WHERE company_id = ? AND url = ?",
-            (company["id"], item["url"]),
-        ).fetchone()
-        if existing:
-            conn.execute(
-                """
-                UPDATE disclosures
-                SET title = ?, document_type = ?, published_at = ?, information_date = ?, source = ?,
-                    summary = ?, importance_score = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    item["title"],
-                    item["document_type"],
-                    item["published_at"],
-                    item["information_date"],
-                    item["source"],
-                    item["summary"],
-                    item["importance_score"],
-                    now,
-                    existing["id"],
-                ),
+        event = upsert_source_event(
+            conn,
+            scope="company",
+            event_type="disclosure",
+            company_id=int(company["id"]),
+            title=item["title"],
+            information_date=item["information_date"],
+            published_at=item["published_at"],
+            source=item["source"],
+            provider="TDnet",
+            url=item["url"],
+            metadata={
+                "document_type": item.get("document_type"),
+                "summary": item.get("summary"),
+                "importance_score": item.get("importance_score"),
+            },
+            raw_payload=item,
+        )
+        record_event_triage(
+            conn,
+            source_event_id=int(event["id"]),
+            company_id=int(company["id"]),
+            action="must_include" if _is_fundamental_disclosure_type(item) else "title_only",
+            relevance_score=float(item.get("importance_score") or 0.5),
+            materiality_score=float(item.get("importance_score") or 0.5),
+            reason="適時開示は企業判断の必須情報として保存",
+            model_name="rule",
+            prompt_version="disclosure_policy_v2",
+        )
+        if item.get("summary"):
+            upsert_event_summary(
+                conn,
+                source_event_id=int(event["id"]),
+                company_id=int(company["id"]),
+                summary_text=item["summary"],
+                summary_type="source_excerpt",
+                model_name="tdnet",
             )
-            disclosure_id = existing["id"]
-        else:
-            cur = conn.execute(
-                """
-                INSERT INTO disclosures
-                    (company_id, title, document_type, published_at, information_date, source, url, local_path,
-                     summary, importance_score, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
-                """,
-                (
-                    company["id"],
-                    item["title"],
-                    item["document_type"],
-                    item["published_at"],
-                    item["information_date"],
-                    item["source"],
-                    item["url"],
-                    item["summary"],
-                    item["importance_score"],
-                    now,
-                    now,
-                ),
-            )
-            disclosure_id = cur.lastrowid
         if extract_enabled and extracted < extract_limit and _should_extract_disclosure_pdf(item):
-            item_with_id = {**item, "id": disclosure_id}
+            item_with_id = {**item, "source_event_id": int(event["id"])}
             try:
-                process_disclosure_pdf(conn, company=company, disclosure=item_with_id)
+                result = process_disclosure_pdf(conn, company=company, disclosure=item_with_id)
+                if result.get("summary"):
+                    upsert_event_summary(
+                        conn,
+                        source_event_id=int(event["id"]),
+                        company_id=int(company["id"]),
+                        summary_text=str(result["summary"]),
+                        summary_type="pdf_extract",
+                        model_name="pypdf",
+                    )
                 extracted += 1
             except DocumentExtractionError:
                 continue
@@ -376,6 +381,16 @@ def update_disclosures_for_company(conn: sqlite3.Connection, security_code: str,
 def _should_extract_disclosure_pdf(item: dict[str, Any]) -> bool:
     if not str(item.get("url") or "").lower().endswith(".pdf"):
         return False
+    return item.get("document_type") in {
+        "earnings_release",
+        "earnings_presentation",
+        "forecast_revision",
+        "dividend",
+        "share_buyback",
+    }
+
+
+def _is_fundamental_disclosure_type(item: dict[str, Any]) -> bool:
     return item.get("document_type") in {
         "earnings_release",
         "earnings_presentation",
@@ -405,32 +420,38 @@ def list_financials_for_company(conn: sqlite3.Connection, security_code: str, li
 
 def list_news_for_company(conn: sqlite3.Connection, security_code: str, limit: int = 20) -> list[dict[str, Any]]:
     company = _company(conn, security_code)
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM news_articles
-        WHERE company_id = ?
-        ORDER BY COALESCE(information_date, substr(published_at, 1, 10)) DESC, id DESC
-        LIMIT ?
-        """,
-        (company["id"], limit),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return _event_items(list_company_events(conn, int(company["id"]), event_types={"company_news"}, limit=limit))
 
 
 def list_disclosures_for_company(conn: sqlite3.Connection, security_code: str, limit: int = 20) -> list[dict[str, Any]]:
     company = _company(conn, security_code)
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM disclosures
-        WHERE company_id = ?
-        ORDER BY COALESCE(information_date, substr(published_at, 1, 10)) DESC, id DESC
-        LIMIT ?
-        """,
-        (company["id"], limit),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    return _event_items(list_company_events(conn, int(company["id"]), event_types={"disclosure"}, limit=limit))
+
+
+def _event_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    for event in events:
+        metadata = event.get("metadata") or {}
+        items.append(
+            {
+                "id": event["id"],
+                "source_event_id": event["id"],
+                "title": event.get("title"),
+                "document_type": metadata.get("document_type"),
+                "published_at": event.get("published_at"),
+                "information_date": event.get("information_date"),
+                "source": event.get("source"),
+                "provider": event.get("provider"),
+                "url": event.get("url"),
+                "content_text": event.get("content_text"),
+                "summary": event.get("summary"),
+                "importance_score": metadata.get("importance_score"),
+                "relevance_score": event.get("relevance_score") or metadata.get("relevance_score"),
+                "selection_reason": event.get("selection_reason") or metadata.get("selection_reason"),
+                "keyword_hits": metadata.get("keyword_hits"),
+            }
+        )
+    return items
 
 
 def _company(conn: sqlite3.Connection, security_code: str) -> dict[str, Any]:

@@ -16,7 +16,6 @@ from ..services.company_sources import (
     update_news_for_company,
 )
 from ..services.content_summaries import summarize_existing_news_for_company
-from ..services.external_factors import ExternalFactorSourceError, update_external_factors_for_company
 from ..services.global_news import GlobalNewsSourceError, update_global_news
 from ..services.indicators import calculate_for_all_companies, calculate_for_company
 from ..services.judgements import run_short_term_judgement
@@ -154,13 +153,8 @@ def update_external_factors(
     payload: JobRequest | None = None,
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict[str, Any]:
-    return _run_company_source_job(
-        conn,
-        payload=payload,
-        job_name="update_external_factors",
-        source="rss_external_factors",
-        updater=update_external_factors_for_company,
-    )
+    del payload
+    return update_global_market_news(conn)
 
 
 @router.post("/update-global-news")
@@ -221,7 +215,7 @@ def update_watchlist_data(
         ):
             try:
                 item[key] = _summarize_update_result(key, updater(security_code))
-            except (PriceSourceError, CompanySourceError, ExternalFactorSourceError, ValueError) as exc:
+            except (PriceSourceError, CompanySourceError, ValueError) as exc:
                 item_errors[key] = str(exc)
         results[security_code] = item
         if item_errors:

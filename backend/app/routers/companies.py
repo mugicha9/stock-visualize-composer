@@ -17,12 +17,7 @@ from ..services.company_sources import (
     update_financials_for_company,
     update_news_for_company,
 )
-from ..services.external_factors import (
-    ExternalFactorSourceError,
-    list_external_factors_for_company,
-    update_external_factors_for_company,
-)
-from ..services.global_news import list_global_news
+from ..services.global_news import GlobalNewsSourceError, list_global_news, update_global_news
 from ..services.indicators import calculate_indicator_rows
 from ..services.price_sources import PriceSourceError, update_prices_for_company
 
@@ -316,8 +311,8 @@ def fetch_company_data(
             errors["news"] = str(exc)
     if request.include_external_factors:
         try:
-            results["external_factors"] = update_external_factors_for_company(conn, security_code)
-        except (ExternalFactorSourceError, ValueError) as exc:
+            results["external_factors"] = update_global_news(conn)
+        except (GlobalNewsSourceError, ValueError) as exc:
             errors["external_factors"] = str(exc)
 
     status = "partial_success" if errors and results else "failed" if errors else "success"

@@ -6,8 +6,14 @@ from datetime import date, datetime
 from typing import Any
 
 from ..database import get_setting, row_to_dict
-from .global_news import list_global_news
+from .material_assessment import assess_material_items
 from .news_relevance import prepare_relevant_news
+from .source_events import (
+    list_company_events,
+    list_global_events,
+    list_important_company_events,
+    list_important_global_events,
+)
 
 
 def _parse_json(value: str | None) -> dict[str, Any]:
@@ -90,28 +96,7 @@ def _recent_disclosures(
     limit: int = 8,
     as_of: str | None = None,
 ) -> list[dict[str, Any]]:
-    params: list[Any] = [company_id]
-    date_expr = "COALESCE(information_date, substr(published_at, 1, 10))"
-    date_filter = ""
-    if as_of:
-        date_filter = f"AND {date_expr} IS NOT NULL AND {date_expr} <= ?"
-        params.append(as_of)
-    params.append(limit)
-    return [
-        dict(row)
-        for row in conn.execute(
-            f"""
-            SELECT id, title, document_type, published_at, {date_expr} AS information_date,
-                   source, url, summary, importance_score
-            FROM disclosures
-            WHERE company_id = ?
-              {date_filter}
-            ORDER BY {date_expr} DESC, id DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-    ]
+    return _events_to_context_items(list_company_events(conn, company_id, event_types={"disclosure"}, as_of=as_of, limit=limit))
 
 
 def _latest_financials(conn: sqlite3.Connection, company_id: int, as_of: str | None = None) -> dict[str, Any] | None:
@@ -145,28 +130,52 @@ def _recent_news(
     limit: int = 16,
     as_of: str | None = None,
 ) -> list[dict[str, Any]]:
-    params: list[Any] = [company_id]
-    date_expr = "COALESCE(information_date, substr(published_at, 1, 10))"
-    date_filter = ""
-    if as_of:
-        date_filter = f"AND {date_expr} IS NOT NULL AND {date_expr} <= ?"
-        params.append(as_of)
-    params.append(limit)
-    return [
-        dict(row)
-        for row in conn.execute(
-            f"""
-            SELECT id, title, published_at, {date_expr} AS information_date,
-                   source, provider, url, content_text, summary, relevance_score, selection_reason, keyword_hits
-            FROM news_articles
-            WHERE company_id = ?
-              {date_filter}
-            ORDER BY {date_expr} DESC, id DESC
-            LIMIT ?
-            """,
-            params,
-        ).fetchall()
-    ]
+    return _events_to_context_items(list_company_events(conn, company_id, event_types={"company_news"}, as_of=as_of, limit=limit))
+
+
+def _events_to_context_items(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    items = []
+    for event in events:
+        metadata = event.get("metadata") or {}
+        items.append(
+            {
+                "id": event.get("id"),
+                "source_event_id": event.get("id"),
+                "event_type": event.get("event_type"),
+                "title": event.get("title"),
+                "document_type": metadata.get("document_type"),
+                "category": metadata.get("category"),
+                "published_at": event.get("published_at"),
+                "information_date": event.get("information_date"),
+                "source": event.get("source"),
+                "provider": event.get("provider"),
+                "url": event.get("url"),
+                "content_text": event.get("content_text"),
+                "summary": event.get("summary"),
+                "importance_score": metadata.get("importance_score"),
+                "relevance_score": event.get("relevance_score") or metadata.get("relevance_score"),
+                "selection_reason": event.get("selection_reason") or metadata.get("selection_reason"),
+                "keyword_hits": metadata.get("keyword_hits"),
+            }
+        )
+    return items
+
+
+def _merge_event_items(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    merged = []
+    for item in [*primary, *secondary]:
+        event_key = str(item.get("source_event_id") or item.get("id") or item.get("url") or item.get("title"))
+        title_key = "title:" + "|".join(
+            str(item.get(key) or "").strip()
+            for key in ("event_type", "title", "information_date", "published_at")
+        )
+        if event_key in seen or title_key in seen:
+            continue
+        seen.add(event_key)
+        seen.add(title_key)
+        merged.append(item)
+    return merged
 
 
 def _compact_text(value: str | None, limit: int = 220) -> str | None:
@@ -251,6 +260,8 @@ def _news_digest(
         items.append(
             {
                 "type": "disclosure",
+                "id": item.get("id"),
+                "source_event_id": item.get("source_event_id") or item.get("id"),
                 "date": event_date,
                 "age_days": _days_old(event_date, as_of),
                 "source": item.get("source"),
@@ -265,6 +276,8 @@ def _news_digest(
         items.append(
             {
                 "type": "company_news",
+                "id": item.get("id"),
+                "source_event_id": item.get("source_event_id") or item.get("id"),
                 "date": event_date,
                 "age_days": _days_old(event_date, as_of),
                 "source": item.get("source"),
@@ -280,6 +293,8 @@ def _news_digest(
         items.append(
             {
                 "type": "global_news",
+                "id": item.get("id"),
+                "source_event_id": item.get("source_event_id") or item.get("id"),
                 "date": event_date,
                 "age_days": _days_old(event_date, as_of),
                 "source": item.get("source"),
@@ -381,6 +396,8 @@ def _fundamental_digest(
         "financial_disclosures": [
             {
                 "date": _event_date(item),
+                "id": item.get("id"),
+                "source_event_id": item.get("source_event_id") or item.get("id"),
                 "age_days": _days_old(_event_date(item), as_of),
                 "title": item.get("title"),
                 "document_type": item.get("document_type"),
@@ -605,7 +622,41 @@ def build_llm_input(
     company_profile = _company_business_profile(conn, company, financials)
     company_for_llm = {**company, "business_profile": company_profile}
     news = _recent_news(conn, int(company["id"]), as_of=effective_as_of)
-    shared_news = list_global_news(conn, limit=40, as_of=effective_as_of)
+    lookback_days = _int_setting(conn, "historical_news_lookback_days", 365)
+    historical_company_limit = _int_setting(conn, "historical_important_events_limit", 12)
+    historical_global_limit = _int_setting(conn, "historical_global_events_limit", 16)
+    recent_company_ids = {
+        int(item["source_event_id"])
+        for item in [*disclosures, *news]
+        if item.get("source_event_id") is not None
+    }
+    historical_company_events = _events_to_context_items(
+        list_important_company_events(
+            conn,
+            int(company["id"]),
+            as_of=effective_as_of,
+            lookback_days=lookback_days,
+            limit=historical_company_limit,
+            exclude_ids=recent_company_ids,
+        )
+    )
+    disclosures = _merge_event_items(disclosures, [item for item in historical_company_events if item.get("event_type") == "disclosure"])
+    news = _merge_event_items(news, [item for item in historical_company_events if item.get("event_type") == "company_news"])
+    recent_global_events = _events_to_context_items(list_global_events(conn, limit=40, as_of=effective_as_of, company_id=int(company["id"])))
+    recent_global_ids = {int(item["source_event_id"]) for item in recent_global_events if item.get("source_event_id") is not None}
+    shared_news = _merge_event_items(
+        recent_global_events,
+        _events_to_context_items(
+            list_important_global_events(
+                conn,
+                company_id=int(company["id"]),
+                as_of=effective_as_of,
+                lookback_days=lookback_days,
+                limit=historical_global_limit,
+                exclude_ids=recent_global_ids,
+            )
+        ),
+    )
     live_run = as_of is None
     use_llm_selection = (
         use_llm_news_selection
@@ -624,6 +675,14 @@ def build_llm_input(
     )
     selected_company_news = selected_news["company_news"]
     selected_global_news = selected_news["global_news"]
+    news_digest = _news_digest(selected_company_news, disclosures, selected_global_news, effective_as_of)
+    news_digest["latest_items"] = assess_material_items(
+        conn,
+        company=company_for_llm,
+        items=news_digest["latest_items"],
+        as_of=effective_as_of,
+        use_llm=bool(use_llm_selection),
+    )
 
     data_warnings: list[str] = []
     if latest_price is None:
@@ -661,7 +720,7 @@ def build_llm_input(
             ],
             "fundamental_digest": _fundamental_digest(financials, disclosures, effective_as_of),
             "company_business_profile": company_profile,
-            "news_digest": _news_digest(selected_company_news, disclosures, selected_global_news, effective_as_of),
+            "news_digest": news_digest,
             "recent_disclosures": [
                 {
                     "title": item.get("title"),
@@ -754,3 +813,10 @@ def build_llm_input(
             "warnings": data_warnings,
         },
     }
+
+
+def _int_setting(conn: sqlite3.Connection, key: str, default: int) -> int:
+    try:
+        return int(get_setting(conn, key, str(default)) or default)
+    except ValueError:
+        return default

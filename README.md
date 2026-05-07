@@ -109,7 +109,7 @@ make llama-command
   "llama_cpp_model_file": "Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf",
   "llama_cpp_port": "10000",
   "llama_cpp_container_port": "8080",
-  "llama_cpp_context_length": "32768",
+  "llama_cpp_context_length": "65536",
   "llama_cpp_gpu_layers": "auto",
   "llama_cpp_reasoning": "off",
   "llama_cpp_reasoning_budget": "0",
@@ -165,19 +165,19 @@ llama.cpp: alias, context_length, n_parallel, ncmoe, gpu_layers, mmap, chat_temp
 - 内閣府
 - 金融庁
 
-共有ニュースは `global_news` に保存され、会社IDは持ちません。企業ニュースは `news_articles` に保存され、会社ごとに保持されます。
+共有ニュース、企業ニュース、適時開示は `source_events` に正規化して保存します。企業別イベントは `company_id` を持ち、経済・政策・地政学などの全体ニュースは `scope=global` として共有します。
 
 ## ニュース戦略
 
 ニュースはすべてをLLMへ渡さず、段階的に圧縮します。
 
 1. 取得時に低価値な定型記事を除外
-2. 企業ニュースは `news_articles` に保存
-3. 経済・政策・地政学など全銘柄共通の情報は `global_news` に保存
-4. AI判断時にタイトルだけで対象企業への重要度を選別
-5. 選ばれた記事だけ本文取得・要約
-6. 要約済み材料をSignal Card化
-7. Context Packetとして最終LLMへ渡す
+2. 企業ニュース、適時開示、全体ニュースを `source_events` に正規化
+3. 保存時・判断時の採否を `event_triage` に保存
+4. AI判断時にタイトルと企業プロフィールで対象企業への重要度を選別
+5. 選ばれた記事だけ本文取得・要約し、`event_summaries` に保存
+6. 要約済み材料をSignal Card化し、判断時のContext Packetに紐付けて保存
+7. Context Packetとして最終LLMへ渡し、使用したSignal Card IDを判断結果へ保存
 
 重視する材料:
 
@@ -194,19 +194,21 @@ llama.cpp: alias, context_length, n_parallel, ncmoe, gpu_layers, mmap, chat_temp
 ```text
 企業取得 / 全体取得
   ↓
+source_eventsへニュース・開示・全体ニュースを正規化
+  ↓
+event_triageへ採否・重要度・理由を保存
+  ↓
+event_summariesへ本文要約・PDF抽出要約を保存
+  ↓
 会社情報・決算・PER/PBR/ROE・価格特徴量を必須入力化
-  ↓
-企業ニュースと全体ニュースをタイトルで重要度選別
-  ↓
-選別記事だけ本文取得・要約
   ↓
 technical / fundamental / news / market のSignal Cardを生成
   ↓
-Context Packetへ集約
+Context Packetへ集約し、context_packets / signal_cardsへ保存
   ↓
 llama.cppまたはMockProviderで中長期判断JSONを生成
   ↓
-ai_judgementsへ保存
+ai_judgements / judgement_signal_linksへ保存
 ```
 
 ## 主な設定キー

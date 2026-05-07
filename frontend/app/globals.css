@@ -1217,9 +1217,14 @@ textarea {
   background: #ffffff;
 }
 
+.signal-card.used {
+  border-color: #93c5fd;
+  background: #f8fbff;
+}
+
 .signal-card summary {
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) auto auto auto;
+  grid-template-columns: auto minmax(120px, 1fr) auto auto auto auto;
   align-items: center;
   gap: 10px;
   min-height: 42px;
@@ -1240,6 +1245,44 @@ textarea {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+.used-signal-badge {
+  padding: 2px 6px;
+  color: #1d4ed8 !important;
+  font-size: 10px !important;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+}
+
+.grounding-status {
+  display: grid;
+  gap: 4px;
+  padding: 9px 11px;
+  border: 1px solid var(--line-soft);
+  background: #f9fafb;
+}
+
+.grounding-status.repaired {
+  border-color: #f59e0b;
+  background: #fffbeb;
+}
+
+.grounding-status span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.grounding-status strong {
+  color: #111827;
+  font-size: 12px;
+}
+
+.grounding-status small {
+  color: #4b5563;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .signal-dot {

@@ -43,6 +43,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "entry_conditions",
         "exit_conditions",
         "risk_notes",
+        "used_signal_ids",
     ],
     "properties": {
         "judgement_type": {"type": "string", "enum": ["mid_long_term"]},
@@ -58,6 +59,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
         "entry_conditions": {"type": "array", "items": {"type": "string"}, "minItems": 1},
         "exit_conditions": {"type": "array", "items": {"type": "string"}, "minItems": 1},
         "risk_notes": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "used_signal_ids": {"type": "array", "items": {"type": "string"}},
         "used_signal_types": {
             "type": "array",
             "items": {"type": "string", "enum": ["technical", "news", "fundamental", "market"]},
@@ -79,6 +81,7 @@ NATURAL_LANGUAGE_OUTPUT_FIELDS = [
 class LLMProvider(ABC):
     name: str
     model_name: str | None
+    last_metadata: dict[str, Any]
 
     @abstractmethod
     def generate(self, prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -90,6 +93,7 @@ class MockProvider(LLMProvider):
 
     def __init__(self, model_name: str | None = "mock-short-term-v0.1") -> None:
         self.model_name = model_name
+        self.last_metadata = {"provider": self.name, "grounding": {"repair_mode": "none", "issues": []}}
 
     def generate(self, prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
         del prompt
@@ -249,6 +253,11 @@ class LlamaCppProvider(LLMProvider):
     def generate(self, prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
         model_input = build_final_judgement_input(payload)
         context_packet = model_input["context_packet"]
+        self.last_metadata = {
+            "provider": self.name,
+            "model_name": self.model_name,
+            "grounding": {"repair_mode": "none", "issues": [], "attempts": 0},
+        }
         messages = [
             {
                 "role": "system",
@@ -259,7 +268,7 @@ class LlamaCppProvider(LLMProvider):
                     + "\n\n返答は売買判断JSONだけにしてください。"
                     + "Context Packetを繰り返してはいけません。"
                     + "説明文、Markdown、コードブロックは禁止です。"
-                    + "judgement_type/action/time_horizon/used_signal_typesはSchemaで指定された英字コードのままにしてください。"
+                    + "judgement_type/action/time_horizon/used_signal_types/used_signal_idsはSchemaで指定された英字コードやIDのままにしてください。"
                     + "summary/positive_factors/negative_factors/entry_conditions/exit_conditions/risk_notesは必ず自然な日本語の文章で書いてください。"
                     + "これらの説明文フィールドでは英語の文、英語の見出し、英語の箇条書きは禁止です。"
                     + "PER/PBR/ROE/EPSなど一般的な指標略語は使ってよいですが、説明は日本語にしてください。"
@@ -276,7 +285,9 @@ class LlamaCppProvider(LLMProvider):
             },
         ]
         last_issues: list[str] = []
+        last_parsed: dict[str, Any] | None = None
         for _ in range(self.max_attempts):
+            self.last_metadata["grounding"]["attempts"] += 1
             try:
                 parsed = llama_cpp_chat_json_request(
                     base_url=self.base_url,
@@ -293,15 +304,12 @@ class LlamaCppProvider(LLMProvider):
                 )
             except LocalLLMRequestError as exc:
                 raise RuntimeError(f"llama.cpp request failed: {exc}{_llama_cpp_error_hint(str(exc), self.model_name)}") from exc
+            last_parsed = parsed
             last_issues = _grounding_issues(parsed, context_packet)
             if not last_issues:
+                self.last_metadata["grounding"]["issues"] = []
                 return parsed
-            if self.auto_repair:
-                repaired = _repair_grounding_output(parsed, last_issues, context_packet)
-                repaired_issues = _grounding_issues(repaired, context_packet)
-                if not repaired_issues:
-                    return repaired
-                last_issues = repaired_issues
+            self.last_metadata["grounding"]["issues"] = last_issues
             messages.append(
                 {
                     "role": "user",
@@ -313,6 +321,14 @@ class LlamaCppProvider(LLMProvider):
                     ),
                 }
             )
+        if self.auto_repair and last_parsed is not None:
+            repaired = _repair_grounding_output(last_parsed, last_issues, context_packet)
+            repaired_issues = _grounding_issues(repaired, context_packet)
+            self.last_metadata["grounding"]["repair_mode"] = "safe_field_fallback"
+            self.last_metadata["grounding"]["issues_before_fallback"] = last_issues
+            self.last_metadata["grounding"]["issues"] = repaired_issues
+            if not repaired_issues:
+                return repaired
         raise RuntimeError(f"LLM output failed grounding checks: {', '.join(last_issues)}")
 
 
@@ -399,6 +415,17 @@ def _grounding_issues(output: dict[str, Any], payload: dict[str, Any]) -> list[s
         values = output.get(key)
         if not isinstance(values, list) or not values or any(not isinstance(item, str) or not item.strip() for item in values):
             issues.append(f"{key}の空欄")
+    valid_signal_ids = {
+        str(card.get("signal_id"))
+        for card in payload.get("signal_cards") or []
+        if isinstance(card, dict) and card.get("signal_id")
+    }
+    used_signal_ids = output.get("used_signal_ids")
+    if valid_signal_ids:
+        if not isinstance(used_signal_ids, list) or any(str(item) not in valid_signal_ids for item in used_signal_ids):
+            issues.append("used_signal_idsの不整合")
+        elif not used_signal_ids:
+            issues.append("used_signal_idsの空欄")
     warnings = (payload.get("data_quality") or {}).get("warnings") or (payload.get("data_status") or {}).get("missing_data") or []
     if output.get("action") == "INSUFFICIENT_DATA" and not warnings:
         issues.append("データ不足の誤判定")
@@ -411,32 +438,14 @@ def _grounding_issues(output: dict[str, Any], payload: dict[str, Any]) -> list[s
 
 def _repair_grounding_output(output: dict[str, Any], issues: list[str], payload: dict[str, Any]) -> dict[str, Any]:
     repaired = dict(output)
-    replacements: dict[str, str] = {}
-    if "業界平均との比較" in issues:
-        replacements.update({"業界平均": "入力済みの財務指標", "同業平均": "入力済みの財務指標"})
-    if "市場平均との比較" in issues:
-        replacements.update({"市場平均": "入力済みの市場材料"})
-    if "未入力の業績修正" in issues:
-        replacements.update(
-            {
-                "上方修正": "業績関連材料",
-                "下方修正": "業績関連材料",
-                "業績予想修正": "業績関連材料",
-                "業績修正": "業績関連材料",
-            }
-        )
-    if "未入力の景気判断" in issues:
-        replacements.update({"景気回復": "外部環境の改善", "景気悪化": "外部環境の悪化"})
-    if "未入力の政策効果" in issues:
-        replacements.update(
-            {
-                "政策支援が見込まれる": "政策関連材料の影響を確認する必要があります",
-                "政策支援を受ける": "政策関連材料の影響を確認する必要があります",
-                "補助金効果": "政策関連材料の影響",
-            }
-        )
     for field in NATURAL_LANGUAGE_OUTPUT_FIELDS:
-        repaired[field] = _repair_value(repaired.get(field), field, replacements, issues)
+        repaired[field] = _safe_grounded_value(field)
+    valid_signal_ids = [
+        str(card.get("signal_id"))
+        for card in payload.get("signal_cards") or []
+        if isinstance(card, dict) and card.get("signal_id")
+    ]
+    repaired["used_signal_ids"] = valid_signal_ids[:3]
 
     warnings = (payload.get("data_quality") or {}).get("warnings") or (payload.get("data_status") or {}).get("missing_data") or []
     if not warnings:
@@ -447,22 +456,10 @@ def _repair_grounding_output(output: dict[str, Any], issues: list[str], payload:
             except (TypeError, ValueError):
                 confidence = 0.0
             repaired["confidence"] = max(confidence, 0.45)
-        for field in NATURAL_LANGUAGE_OUTPUT_FIELDS:
-            repaired[field] = _repair_value(
-                repaired.get(field),
-                field,
-                {
-                    "情報不足": "判断材料の方向感が限定的",
-                    "データ不足": "判断材料の方向感が限定的",
-                    "情報が不足": "判断材料の方向感が限定的",
-                    "データが不足": "判断材料の方向感が限定的",
-                },
-                issues,
-            )
     return repaired
 
 
-def _repair_value(value: Any, field: str, replacements: dict[str, str], issues: list[str]) -> Any:
+def _safe_grounded_value(field: str) -> str | list[str]:
     fallback = {
         "summary": "入力済みのSignal Cardを根拠に、中長期では条件付きで監視する局面です。",
         "positive_factors": "入力済みのファンダメンタル、ニュース、価格材料のうち支援材料を確認します。",
@@ -471,18 +468,7 @@ def _repair_value(value: Any, field: str, replacements: dict[str, str], issues: 
         "exit_conditions": "決算、開示、価格動向の悪化が入力で確認された場合は撤退を検討します。",
         "risk_notes": "入力にない事実は根拠にせず、保存済み材料の更新で判断を見直します。",
     }.get(field, "入力済み材料だけを根拠に判断します。")
-    if isinstance(value, str):
-        text = value
-        for source, target in replacements.items():
-            text = text.replace(source, target)
-        if ("英語文の混入" in issues and _contains_english_sentence(text)) or not text.strip():
-            return fallback
-        return text
-    if isinstance(value, list):
-        repaired = [_repair_value(item, field, replacements, issues) for item in value]
-        repaired = [item for item in repaired if isinstance(item, str) and item.strip()]
-        return repaired or [fallback]
-    return [fallback] if field != "summary" else fallback
+    return fallback if field == "summary" else [fallback]
 
 
 def _natural_language_output_values(output: dict[str, Any]) -> list[str]:
@@ -545,6 +531,8 @@ def validate_judgement_output(output: dict[str, Any]) -> dict[str, Any]:
     for key in ["positive_factors", "negative_factors", "entry_conditions", "exit_conditions", "risk_notes"]:
         if not isinstance(output[key], list) or not all(isinstance(item, str) for item in output[key]):
             raise ValueError(f"{key} must be a string array")
+    if not isinstance(output["used_signal_ids"], list) or not all(isinstance(item, str) for item in output["used_signal_ids"]):
+        raise ValueError("used_signal_ids must be a string array")
     if not isinstance(output["summary"], str) or not output["summary"].strip():
         raise ValueError("summary must be a non-empty string")
     return output
@@ -641,4 +629,5 @@ def _judgement(
         "entry_conditions": entry,
         "exit_conditions": exit_,
         "risk_notes": risks,
+        "used_signal_ids": [],
     }

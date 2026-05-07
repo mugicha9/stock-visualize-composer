@@ -72,6 +72,7 @@ export type JudgementOutput = {
   entry_conditions: string[];
   exit_conditions: string[];
   risk_notes: string[];
+  used_signal_ids?: string[];
   used_signal_types?: Array<"technical" | "news" | "fundamental" | "market">;
 };
 
@@ -112,6 +113,20 @@ export type SignalCard = {
   category?: string | null;
   topic?: string | null;
   title?: string | null;
+  db_id?: number | null;
+  used_by_judgement?: boolean | null;
+  material_assessment?: {
+    provider?: string;
+    direction?: string;
+    direction_score?: number;
+    impact_score?: number;
+    confidence?: number;
+    company_relevance?: number;
+    expectation_gap?: string;
+    reason?: string;
+    risk_notes?: string[];
+    used_evidence?: string[];
+  } | null;
 };
 
 export type ContextSummaryBlock = {
@@ -191,6 +206,7 @@ export type JudgementContext = {
     selected_global_news: JudgementSourceItem[];
   };
   generated_from_saved_input: boolean;
+  loaded_from_context_packet?: boolean;
 };
 
 export type Disclosure = {

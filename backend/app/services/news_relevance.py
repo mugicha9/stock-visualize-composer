@@ -9,6 +9,7 @@ from ..database import NEWS_RELEVANCE_POLICY_PROMPT, NEWS_RELEVANCE_SYSTEM_PROMP
 from .content_summaries import fetch_article_text, summarize_news_item
 from .local_llm import LocalLLMRequestError, llama_cpp_chat_json
 from .signal_pipeline import NEGATIVE_TERMS, POSITIVE_TERMS
+from .source_events import record_event_triage, upsert_event_summary
 
 
 RANKING_SCHEMA: dict[str, Any] = {
@@ -51,7 +52,6 @@ def prepare_relevant_news(
             items=company_news,
             group="company_news",
             max_items=max_company,
-            table="news_articles",
             allow_fetch=allow_fetch,
             use_llm_ranking=use_llm_ranking,
         ),
@@ -61,7 +61,6 @@ def prepare_relevant_news(
             items=global_news,
             group="global_news",
             max_items=max_global,
-            table="global_news",
             allow_fetch=allow_fetch,
             use_llm_ranking=use_llm_ranking,
         ),
@@ -75,7 +74,6 @@ def _prepare_group(
     items: list[dict[str, Any]],
     group: str,
     max_items: int,
-    table: str,
     allow_fetch: bool,
     use_llm_ranking: bool,
 ) -> list[dict[str, Any]]:
@@ -93,11 +91,29 @@ def _prepare_group(
         if allow_fetch and not prepared.get("content_text"):
             prepared["content_text"] = fetch_article_text(prepared.get("url"))
             if prepared["content_text"]:
-                conn.execute(f"UPDATE {table} SET content_text = ?, updated_at = ? WHERE id = ?", (prepared["content_text"], now, item["id"]))
+                conn.execute("UPDATE source_events SET content_text = ?, updated_at = ? WHERE id = ?", (prepared["content_text"], now, item["id"]))
         if allow_fetch and not prepared.get("summary"):
             prepared["summary"] = summarize_news_item(conn, company=company, item=prepared)
-            if prepared["summary"] and table in {"news_articles", "global_news"}:
-                conn.execute(f"UPDATE {table} SET summary = ?, updated_at = ? WHERE id = ?", (prepared["summary"], now, item["id"]))
+            if prepared["summary"]:
+                upsert_event_summary(
+                    conn,
+                    source_event_id=int(item["id"]),
+                    company_id=int(company["id"]) if company.get("id") else None,
+                    summary_text=prepared["summary"],
+                    summary_type="llm_compressed",
+                    model_name=get_setting(conn, "news_summary_provider", "llama_cpp") or "llama_cpp",
+                )
+        record_event_triage(
+            conn,
+            source_event_id=int(item["id"]),
+            company_id=int(company["id"]) if company.get("id") else None,
+            action="must_include" if ranking.get("relevance_score", 0) >= 0.75 else "summarize",
+            relevance_score=float(ranking.get("relevance_score") or 0),
+            materiality_score=float(ranking.get("relevance_score") or 0),
+            reason=str(ranking.get("reason") or "重要材料として選択"),
+            model_name="llama_cpp" if use_llm_ranking else "rule",
+            prompt_version=group,
+        )
         selected.append(
             {
                 **prepared,

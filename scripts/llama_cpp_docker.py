@@ -24,7 +24,7 @@ DEFAULTS = {
     "llama_cpp_host": "0.0.0.0",
     "llama_cpp_port": "10000",
     "llama_cpp_container_port": "8080",
-    "llama_cpp_context_length": "32768",
+    "llama_cpp_context_length": "65536",
     "llama_cpp_n_parallel": "1",
     "llama_cpp_ncmoe": "24",
     "llama_cpp_gpu_layers": "auto",

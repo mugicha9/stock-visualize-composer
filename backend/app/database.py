@@ -113,6 +113,12 @@ def ensure_current_schema(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "news_articles", "relevance_score", "REAL")
     _ensure_column(conn, "news_articles", "selection_reason", "TEXT")
     _ensure_column(conn, "news_articles", "keyword_hits", "TEXT")
+    _ensure_column(conn, "ai_judgements", "context_packet_id", "INTEGER")
+    _ensure_column(conn, "signal_cards", "context_packet_id", "INTEGER")
+    _ensure_column(conn, "signal_cards", "judgement_id", "INTEGER")
+    _ensure_column(conn, "signal_cards", "signal_id", "TEXT")
+    _ensure_column(conn, "signal_cards", "payload_json", "TEXT")
+    _ensure_column(conn, "signal_cards", "source_event_id", "INTEGER")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS company_news_profiles (
@@ -135,6 +141,123 @@ def ensure_current_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_company_news_profiles_company
         ON company_news_profiles(company_id)
+        """
+    )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS source_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_key TEXT NOT NULL UNIQUE,
+            scope TEXT NOT NULL,
+            company_id INTEGER,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            information_date TEXT,
+            published_at TEXT,
+            source TEXT,
+            provider TEXT,
+            url TEXT,
+            content_text TEXT,
+            content_hash TEXT,
+            metadata_json TEXT,
+            raw_payload_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+
+            FOREIGN KEY (company_id) REFERENCES companies(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_events_company_type_date
+        ON source_events(company_id, event_type, information_date);
+
+        CREATE INDEX IF NOT EXISTS idx_source_events_scope_type_date
+        ON source_events(scope, event_type, information_date);
+
+        CREATE TABLE IF NOT EXISTS event_triage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            triage_key TEXT NOT NULL UNIQUE,
+            source_event_id INTEGER NOT NULL,
+            company_id INTEGER,
+            action TEXT NOT NULL,
+            relevance_score REAL,
+            materiality_score REAL,
+            reason TEXT,
+            model_name TEXT,
+            prompt_version TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+
+            FOREIGN KEY (source_event_id) REFERENCES source_events(id),
+            FOREIGN KEY (company_id) REFERENCES companies(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_triage_event_company
+        ON event_triage(source_event_id, company_id);
+
+        CREATE TABLE IF NOT EXISTS event_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_key TEXT NOT NULL UNIQUE,
+            source_event_id INTEGER NOT NULL,
+            company_id INTEGER,
+            summary_type TEXT NOT NULL,
+            prompt_version TEXT,
+            model_name TEXT,
+            language TEXT NOT NULL DEFAULT 'ja',
+            summary_text TEXT NOT NULL,
+            structured_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+
+            FOREIGN KEY (source_event_id) REFERENCES source_events(id),
+            FOREIGN KEY (company_id) REFERENCES companies(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_summaries_event_company
+        ON event_summaries(source_event_id, company_id, summary_type);
+
+        CREATE TABLE IF NOT EXISTS context_packets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            judgement_type TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            build_version TEXT NOT NULL,
+            packet_json TEXT NOT NULL,
+            included_signal_ids_json TEXT,
+            excluded_signal_ids_json TEXT,
+            token_estimate INTEGER,
+            created_at TEXT NOT NULL,
+
+            FOREIGN KEY (company_id) REFERENCES companies(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_packets_company_as_of
+        ON context_packets(company_id, as_of, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_signal_cards_context_packet
+        ON signal_cards(context_packet_id);
+
+        CREATE INDEX IF NOT EXISTS idx_signal_cards_source_event
+        ON signal_cards(source_event_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_cards_context_signal
+        ON signal_cards(context_packet_id, signal_id);
+
+        CREATE TABLE IF NOT EXISTS judgement_signal_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            judgement_id INTEGER NOT NULL,
+            signal_card_id INTEGER NOT NULL,
+            signal_id TEXT NOT NULL,
+            usage_type TEXT NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL,
+
+            FOREIGN KEY (judgement_id) REFERENCES ai_judgements(id),
+            FOREIGN KEY (signal_card_id) REFERENCES signal_cards(id),
+            UNIQUE(judgement_id, signal_id, usage_type)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_judgement_signal_links_judgement
+        ON judgement_signal_links(judgement_id);
         """
     )
 
@@ -182,6 +305,7 @@ def default_app_settings() -> dict[str, str]:
         "llama_cpp_repeat_penalty": str(LLAMA_CPP_REPEAT_PENALTY),
         "llm_judgement_max_attempts": "5",
         "llm_grounding_auto_repair_enabled": "1",
+        "context_packet_retention_per_company": "80",
         "llama_cpp_container_name": LLAMA_CPP_CONTAINER_NAME,
         "llama_cpp_image": LLAMA_CPP_IMAGE,
         "llama_cpp_docker_restart": LLAMA_CPP_DOCKER_RESTART,
@@ -221,8 +345,17 @@ def default_app_settings() -> dict[str, str]:
         "news_summary_max_items": str(NEWS_SUMMARY_MAX_ITEMS),
         "news_summary_timeout_seconds": str(NEWS_SUMMARY_TIMEOUT_SECONDS),
         "news_summary_on_update": NEWS_SUMMARY_ON_UPDATE,
+        "material_assessment_enabled": "1",
+        "material_assessment_max_items": "16",
+        "material_assessment_batch_size": "4",
+        "material_assessment_timeout_seconds": "180",
+        "historical_news_lookback_days": "365",
+        "historical_important_events_limit": "12",
+        "historical_global_events_limit": "16",
         "prompt_news_summary_system": NEWS_SUMMARY_SYSTEM_PROMPT,
         "prompt_news_summary_task": NEWS_SUMMARY_TASK_PROMPT,
+        "prompt_material_assessment_system": MATERIAL_ASSESSMENT_SYSTEM_PROMPT,
+        "prompt_material_assessment_task": MATERIAL_ASSESSMENT_TASK_PROMPT,
         "prompt_news_relevance_system": NEWS_RELEVANCE_SYSTEM_PROMPT,
         "prompt_news_relevance_policy": NEWS_RELEVANCE_POLICY_PROMPT,
         "prompt_company_news_profile_system": COMPANY_NEWS_PROFILE_SYSTEM_PROMPT,
@@ -333,6 +466,7 @@ PER/PBR/ROE/EPS/配当利回りなど一般的な指標略語は使ってよい�
 - judgement_typeはmid_long_termにする
 - action/confidence/time_horizon/summary/positive_factors/negative_factors/entry_conditions/exit_conditions/risk_notesを必ず含める
 - used_signal_typesを出す場合は、実際に使ったtechnical/news/fundamental/marketだけを入れる
+- used_signal_idsには、判断に実際に使ったsignal_cardsのsignal_idだけを入れる
 - judgement_type/action/time_horizon/used_signal_types以外の説明文はすべて日本語で書く
 - summaryには、会社の主力/関連テーマに照らした材料解釈と、使った主要Signalを2種類以上含める
 - positive_factors/negative_factors/risk_notesは空にしない
@@ -352,6 +486,20 @@ NEWS_SUMMARY_TASK_PROMPT = """中長期判断で使えるよう、分類、要�
 要約には「この企業のどの事業・収益要因に関係するか」を分かる範囲で含めてください。
 本文が十分にある場合は本文を根拠にしてください。
 本文がない場合はタイトルだけから分かることに限定し、断定を避けてください。
+"""
+
+MATERIAL_ASSESSMENT_SYSTEM_PROMPT = """あなたは日本株の材料評価担当です。
+入力されたニュース、適時開示、全体ニュースを、対象企業のcompany_profileに照らして評価してください。
+単純な良材料/悪材料の一般論ではなく、その企業の主力事業、需要先、原材料、規制、市況、財務指標にどう影響するかで判断します。
+市場期待やコンセンサスとのギャップが入力にない場合は、expectation_gapをunknownにしてください。
+本文や要約にない事実を作らず、不明な場合はneutralまたはuncertainにしてください。
+出力はJSONのみ、理由とリスクは日本語で書いてください。
+"""
+
+MATERIAL_ASSESSMENT_TASK_PROMPT = """各itemについて、direction_score、impact_score、confidence、company_relevanceを返してください。
+direction_scoreはこの企業にとっての中長期方向性です。
+impact_scoreは方向と独立した重要度です。
+キーワードだけで強い方向を付けず、企業との関係が弱い場合はcompany_relevanceとconfidenceを下げてください。
 """
 
 NEWS_RELEVANCE_SYSTEM_PROMPT = """あなたは日本株の情報選別担当です。
@@ -389,7 +537,7 @@ signal_cardsにfundamental/news/marketが存在する場合は、summary、posit
 signal_cardsに業績予想修正だけがあり上方修正/下方修正がない場合は、方向不明の修正として扱ってください。
 テクニカル指標だけで結論を出してはいけません。
 judgement_typeは必ずmid_long_termにしてください。
-必ず judgement_type/action/confidence/time_horizon/summary/positive_factors/negative_factors/entry_conditions/exit_conditions/risk_notes を含む判断JSONだけを返してください。
+必ず judgement_type/action/confidence/time_horizon/summary/positive_factors/negative_factors/entry_conditions/exit_conditions/risk_notes/used_signal_ids を含む判断JSONだけを返してください。
 """
 
 FINAL_JUDGEMENT_REPAIR_INSTRUCTION = """前回の出力にはContext Packetにない事実または比較が含まれていました。

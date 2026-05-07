@@ -71,7 +71,9 @@ def build_final_judgement_input(payload: dict[str, Any]) -> dict[str, Any]:
                 "Context Packetにない長期予測を作らない",
                 "リアルタイム株価がある前提で判断しない",
                 "根拠が弱いのにBUYまたはSELLを出さない",
+                "signal_cardsに存在しないsignal_idをused_signal_idsに入れない",
             ],
+            "used_signal_ids_rule": "判断に使ったsignal_cardsのsignal_idをused_signal_idsへ必ず入れる。",
             "output_language": "ja",
         },
         "context_packet": build_context_packet(payload),
@@ -299,14 +301,26 @@ def _news_and_market_signals(payload: dict[str, Any]) -> list[dict[str, Any]]:
         text = f"{title} {summary}"
         llm_topic = _summary_field(summary, "分類")
         category = _topic_category(llm_topic) or _classify(text)
-        score = _keyword_score(text)
-        impact = _impact_score(item, category, score)
+        assessment = item.get("material_assessment") if isinstance(item.get("material_assessment"), dict) else {}
+        score = _assessment_score(assessment) if assessment else _keyword_score(text)
+        impact = _impact_score(item, category, score, assessment)
         if impact < 0.3 and abs(score) < 0.25:
             continue
         evidence = [*_news_evidence(title, summary), *_keyword_evidence(text)]
+        if assessment.get("reason"):
+            evidence.insert(0, f"材料評価: {assessment.get('reason')}")
+        for used in assessment.get("used_evidence") or []:
+            evidence.append(f"評価根拠: {used}")
         if category == "forecast_revision":
             evidence.insert(0, "業績予想修正に関連する材料です。")
-        extra = {"title": title}
+        confidence = _num(assessment.get("confidence")) if assessment else None
+        extra = {
+            "title": title,
+            "source_event_id": item.get("source_event_id") or item.get("id"),
+            "source_id": item.get("source_event_id") or item.get("id"),
+        }
+        if assessment:
+            extra["material_assessment"] = assessment
         if llm_topic:
             extra["topic"] = llm_topic
         cards.append(
@@ -318,12 +332,12 @@ def _news_and_market_signals(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 published_at=item.get("date") or item.get("published_at"),
                 direction_score=score,
                 impact_score=impact,
-                confidence=0.7 if evidence else 0.45,
+                confidence=confidence if confidence is not None else (0.7 if evidence else 0.45),
                 freshness_score=_freshness(item.get("age_days")),
-                relevance_score=item.get("relevance_score") or 0.75,
-                summary=_material_summary(score, title, summary, llm_topic),
+                relevance_score=assessment.get("company_relevance") if assessment else (item.get("relevance_score") or 0.75),
+                summary=_material_summary(score, title, summary, llm_topic, assessment),
                 evidence=evidence or ([title] if title else ["ニュース材料の方向感は限定的です。"]),
-                risk_notes=_material_risks(category, score, item, summary),
+                risk_notes=_material_risks(category, score, item, summary, assessment),
                 extra=extra,
             )
         )
@@ -518,11 +532,11 @@ def _keyword_score(text: str) -> float:
     score = 0.0
     for term, value in POSITIVE_TERMS.items():
         if term in text:
-            score += value
+            score += value * 0.12
     for term, value in NEGATIVE_TERMS.items():
         if term in text:
-            score += value
-    return _clamp(score, -2.0, 2.0)
+            score += value * 0.12
+    return _clamp(score, -0.3, 0.3)
 
 
 def _keyword_evidence(text: str) -> list[str]:
@@ -564,8 +578,22 @@ def _topic_category(topic: str | None) -> str | None:
     return mapping.get(topic or "")
 
 
-def _impact_score(item: dict[str, Any], category: str, direction_score: float) -> float:
+def _assessment_score(assessment: dict[str, Any]) -> float:
+    score = _num(assessment.get("direction_score"))
+    if score is None:
+        return 0.0
+    return _clamp(score, -1.0, 1.0)
+
+
+def _impact_score(item: dict[str, Any], category: str, direction_score: float, assessment: dict[str, Any] | None = None) -> float:
     source_type = item.get("type")
+    if assessment:
+        assessed_impact = _num(assessment.get("impact_score"))
+        assessed_relevance = _num(assessment.get("company_relevance"))
+        if assessed_impact is not None:
+            if assessed_relevance is not None and assessed_relevance < 0.25:
+                assessed_impact *= 0.5
+            return _clamp(assessed_impact, 0.0, 1.0)
     if source_type == "disclosure":
         base = 0.72
     elif source_type == "global_news":
@@ -585,19 +613,24 @@ def _impact_score(item: dict[str, Any], category: str, direction_score: float) -
     return _clamp(base, 0.0, 1.0)
 
 
-def _material_summary(score: float, title: str, summary: str, llm_topic: str | None) -> str:
+def _material_summary(score: float, title: str, summary: str, llm_topic: str | None, assessment: dict[str, Any] | None = None) -> str:
     direction = "ポジティブ" if score >= 0.35 else "ネガティブ" if score <= -0.35 else "中立"
     summary_text = _summary_field(summary, "要約") or _plain_summary(summary)
     materiality = _summary_field(summary, "材料性")
     topic_text = f"LLM分類: {llm_topic}。 " if llm_topic else ""
     materiality_text = f"材料性: {materiality}。 " if materiality else ""
+    assessment_text = f"材料評価: {assessment.get('reason')} " if assessment and assessment.get("reason") else ""
     if summary_text:
-        return f"{topic_text}{materiality_text}記事要約: {summary_text} 中長期方向は{direction}寄りです。タイトル: {title}"
-    return f"{topic_text}{materiality_text}記事本文の要約は未取得です。中長期方向は{direction}寄りです。タイトル: {title}"
+        return f"{topic_text}{materiality_text}{assessment_text}記事要約: {summary_text} 中長期方向は{direction}寄りです。タイトル: {title}"
+    return f"{topic_text}{materiality_text}{assessment_text}記事本文の要約は未取得です。中長期方向は{direction}寄りです。タイトル: {title}"
 
 
-def _material_risks(category: str, score: float, item: dict[str, Any], summary: str) -> list[str]:
+def _material_risks(category: str, score: float, item: dict[str, Any], summary: str, assessment: dict[str, Any] | None = None) -> list[str]:
     risks = []
+    for risk in (assessment or {}).get("risk_notes") or []:
+        risks.append(str(risk))
+    if assessment and assessment.get("expectation_gap") == "unknown":
+        risks.append("市場期待とのギャップは入力にないため断定しません。")
     summary_risk = _summary_field(summary, "注意")
     if summary_risk:
         risks.append(f"要約上の注意: {summary_risk}")

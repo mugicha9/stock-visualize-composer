@@ -14,6 +14,8 @@ router = APIRouter(prefix="/prompts", tags=["prompts"])
 SETTING_PROMPTS = [
     ("prompt_news_summary_system", "ニュース要約: system"),
     ("prompt_news_summary_task", "ニュース要約: task"),
+    ("prompt_material_assessment_system", "材料評価: system"),
+    ("prompt_material_assessment_task", "材料評価: task"),
     ("prompt_news_relevance_system", "ニュース選別: system"),
     ("prompt_news_relevance_policy", "ニュース選別: policy"),
     ("prompt_company_news_profile_system", "企業別キーワード: system"),

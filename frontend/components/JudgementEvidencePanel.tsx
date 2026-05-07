@@ -13,6 +13,10 @@ export function JudgementEvidencePanel({ context }: { context?: JudgementContext
   const cards = packet.signal_cards ?? [];
   const newsItems = context.source_items.news_digest_items ?? [];
   const output = context.judgement.output;
+  const usedSignalIds = new Set(output?.used_signal_ids ?? []);
+  const grounding = context.judgement.model_options?.grounding as
+    | { repair_mode?: string; issues?: string[]; issues_before_fallback?: string[]; attempts?: number }
+    | undefined;
 
   return (
     <div className="evidence-panel">
@@ -36,6 +40,8 @@ export function JudgementEvidencePanel({ context }: { context?: JudgementContext
         <EvidenceMetric label="News/Market" value={formatScore(aggregate.news_score)} />
       </div>
 
+      {grounding ? <GroundingStatus grounding={grounding} loadedFromPacket={context.loaded_from_context_packet} /> : null}
+
       <CompanyProfile profile={packet.company_profile} />
 
       <div className="context-summary-grid">
@@ -51,7 +57,12 @@ export function JudgementEvidencePanel({ context }: { context?: JudgementContext
         </div>
         <div className="signal-card-list">
           {cards.map((card, index) => (
-            <SignalCardView card={card} key={card.signal_id || `${card.source_type}-${index}`} open={index < 3} />
+            <SignalCardView
+              card={card}
+              key={card.signal_id || `${card.source_type}-${index}`}
+              open={index < 3 || usedSignalIds.has(card.signal_id) || Boolean(card.used_by_judgement)}
+              used={usedSignalIds.has(card.signal_id) || Boolean(card.used_by_judgement)}
+            />
           ))}
           {cards.length === 0 ? <p className="empty-text">Signal Cardなし</p> : null}
         </div>
@@ -64,6 +75,30 @@ export function JudgementEvidencePanel({ context }: { context?: JudgementContext
         </div>
         <SourceItems items={newsItems} />
       </section>
+    </div>
+  );
+}
+
+function GroundingStatus({
+  grounding,
+  loadedFromPacket
+}: {
+  grounding: { repair_mode?: string; issues?: string[]; issues_before_fallback?: string[]; attempts?: number };
+  loadedFromPacket?: boolean;
+}) {
+  const repaired = grounding.repair_mode && grounding.repair_mode !== "none";
+  return (
+    <div className={repaired ? "grounding-status repaired" : "grounding-status"}>
+      <span>{loadedFromPacket ? "保存済みContext Packet" : "再構築Context Packet"}</span>
+      <strong>{repaired ? `Grounding補正: ${grounding.repair_mode}` : "Grounding補正なし"}</strong>
+      <small>
+        {[
+          grounding.attempts !== undefined ? `attempts ${grounding.attempts}` : null,
+          grounding.issues_before_fallback?.length ? `issues: ${grounding.issues_before_fallback.join(", ")}` : null
+        ]
+          .filter(Boolean)
+          .join(" / ")}
+      </small>
     </div>
   );
 }
@@ -128,12 +163,13 @@ function ContextSummary({ title, summary }: { title: string; summary?: ContextSu
   );
 }
 
-function SignalCardView({ card, open }: { card: SignalCard; open: boolean }) {
+function SignalCardView({ card, open, used }: { card: SignalCard; open: boolean; used: boolean }) {
   return (
-    <details className={`signal-card signal-${card.source_type}`} open={open}>
+    <details className={`signal-card signal-${card.source_type}${used ? " used" : ""}`} open={open}>
       <summary>
         <span className={`signal-dot direction-${card.direction}`} />
         <strong>{sourceLabel(card.source_type)}</strong>
+        {used ? <span className="used-signal-badge">USED</span> : null}
         <span>{card.direction}</span>
         <span>impact {formatScore(card.impact_score)}</span>
         <span>{card.published_at ?? "-"}</span>
@@ -141,6 +177,11 @@ function SignalCardView({ card, open }: { card: SignalCard; open: boolean }) {
       <div className="signal-card-body">
         <p>{card.summary}</p>
         {card.topic ? <span className="summary-chip">LLM分類: {card.topic}</span> : null}
+        {card.material_assessment ? (
+          <span className="summary-chip">
+            材料評価: {card.material_assessment.provider ?? "-"} / relevance {formatScore(card.material_assessment.company_relevance)}
+          </span>
+        ) : null}
         <SignalList title="根拠" items={card.evidence ?? []} />
         <SignalList title="リスク" items={card.risk_notes ?? []} />
       </div>

@@ -9,8 +9,9 @@ import urllib.request
 from html.parser import HTMLParser
 from typing import Any
 
-from ..database import NEWS_SUMMARY_SYSTEM_PROMPT, NEWS_SUMMARY_TASK_PROMPT, get_setting, utc_now
+from ..database import NEWS_SUMMARY_SYSTEM_PROMPT, NEWS_SUMMARY_TASK_PROMPT, get_setting
 from .local_llm import LocalLLMRequestError, llama_cpp_chat_json
+from .source_events import list_company_events, upsert_event_summary
 
 
 NEWS_TOPIC_ENUM = [
@@ -100,37 +101,25 @@ def summarize_existing_news_for_company(
     force: bool = False,
 ) -> list[dict[str, Any]]:
     company = _company(conn, security_code)
-    where = "company_id = ?"
-    params: list[Any] = [company["id"]]
-    if not force:
-        where += " AND (summary IS NULL OR summary = '')"
-    params.append(limit)
-    rows = conn.execute(
-        f"""
-        SELECT *
-        FROM news_articles
-        WHERE {where}
-        ORDER BY COALESCE(information_date, substr(published_at, 1, 10)) DESC, id DESC
-        LIMIT ?
-        """,
-        params,
-    ).fetchall()
-    now = utc_now()
+    rows = list_company_events(conn, int(company["id"]), event_types={"company_news"}, limit=limit * 3)
     updated: list[dict[str, Any]] = []
-    for row in rows:
-        item = dict(row)
+    for item in rows:
+        if not force and item.get("summary"):
+            continue
         summary = summarize_news_item(conn, company=company, item=item)
         if not summary:
             continue
-        conn.execute(
-            """
-            UPDATE news_articles
-            SET summary = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (summary, now, item["id"]),
+        upsert_event_summary(
+            conn,
+            source_event_id=int(item["id"]),
+            company_id=int(company["id"]),
+            summary_text=summary,
+            summary_type="llm_compressed",
+            model_name=get_setting(conn, "news_summary_provider", "llama_cpp") or "llama_cpp",
         )
         updated.append({**item, "summary": summary})
+        if len(updated) >= limit:
+            break
     return updated
 
 

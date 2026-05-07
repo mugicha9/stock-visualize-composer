@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 
-INFORMATION_DATE_TABLES = ("news_articles", "disclosures", "external_factors", "global_news")
+INFORMATION_DATE_TABLES = ("source_events", "news_articles", "disclosures", "external_factors", "global_news")
 
 
 def ensure_information_date_columns(conn: sqlite3.Connection) -> None:

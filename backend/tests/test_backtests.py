@@ -4,6 +4,7 @@ import json
 import sqlite3
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from backend.app.models import BacktestRequest
 from backend.app.services.backtests import _decision_indices, run_backtest
@@ -11,14 +12,16 @@ from backend.app.services.company_sources import _split_news_text
 from backend.app.services.content_summaries import _extract_article_text, _format_summary
 from backend.app.services.features import build_llm_input
 from backend.app.services.information_dates import refresh_information_dates
-from backend.app.services.judgements import get_judgement_context
+from backend.app.services.judgements import get_judgement_context, run_short_term_judgement
 from backend.app.services.llm import MockProvider, _grounding_issues, _repair_grounding_output
+from backend.app.services.material_assessment import assess_material_items
 from backend.app.services.company_news_profile import fallback_company_news_profile, score_company_news_candidate
 from backend.app.services.signal_pipeline import (
     build_context_packet,
     build_final_judgement_input,
     format_context_packet_markdown,
 )
+from backend.app.services.source_events import record_event_triage, upsert_event_summary, upsert_source_event
 
 
 class BacktestLeakageTest(unittest.TestCase):
@@ -154,6 +157,72 @@ class BacktestLeakageTest(unittest.TestCase):
         self.assertEqual(context_packet["aggregated_signal"]["overall_bias"], "bullish")
         self.assertEqual(context_packet["aggregated_signal"]["weights"]["technical"], 0.2)
 
+    def test_build_llm_input_includes_older_important_events(self) -> None:
+        self._seed_context()
+        for index in range(24):
+            self._insert_event(
+                "company_news",
+                f"recent filler {index}",
+                "2026-01-10",
+                f"https://example.test/recent-filler-{index}",
+                action="title_only",
+                relevance_score=0.1,
+            )
+        self._insert_event(
+            "company_news",
+            "older important 大型受注",
+            "2025-09-01",
+            "https://example.test/older-important-order",
+            action="must_include",
+            relevance_score=1.0,
+        )
+        refresh_information_dates(self.conn)
+
+        payload = build_llm_input(self.conn, "7203", as_of="2026-01-10", use_llm_news_selection=False)
+        titles = {item["title"] for item in payload["event_context"]["news_digest"]["latest_items"]}
+
+        self.assertIn("older important 大型受注", titles)
+
+    def test_material_assessment_batches_llm_calls(self) -> None:
+        self.conn.execute("INSERT INTO app_settings(key, value, updated_at) VALUES ('material_assessment_batch_size', '2', '2026-01-01')")
+        self.conn.execute("INSERT INTO app_settings(key, value, updated_at) VALUES ('material_assessment_max_items', '3', '2026-01-01')")
+        items = [{"type": "company_news", "title": f"item {index}", "summary": "分類: 不明 要約: test"} for index in range(4)]
+
+        def fake_llm(conn, *, messages, schema, temperature, timeout_seconds):
+            del conn, schema, temperature, timeout_seconds
+            payload = json.loads(messages[1]["content"])
+            return {
+                "assessments": [
+                    {
+                        "id": row["id"],
+                        "direction": "neutral",
+                        "direction_score": 0,
+                        "impact_score": 0.5,
+                        "confidence": 0.8,
+                        "company_relevance": 0.7,
+                        "expectation_gap": "unknown",
+                        "reason": f"評価 {row['id']}",
+                        "risk_notes": ["市場期待は不明です。"],
+                        "used_evidence": [row["title"]],
+                    }
+                    for row in payload["items"]
+                ]
+            }
+
+        with patch("backend.app.services.material_assessment.llama_cpp_chat_json", side_effect=fake_llm) as mocked:
+            assessed = assess_material_items(
+                self.conn,
+                company={"security_code": "7203", "name": "Toyota", "business_profile": {}},
+                items=items,
+                as_of="2026-01-10",
+                use_llm=True,
+            )
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(assessed[0]["material_assessment"]["provider"], "llama_cpp")
+        self.assertEqual(assessed[2]["material_assessment"]["provider"], "llama_cpp")
+        self.assertEqual(assessed[3]["material_assessment"]["provider"], "llm_error_fallback")
+
     def test_context_packet_markdown_surfaces_fundamentals_and_news(self) -> None:
         self._seed_context()
         refresh_information_dates(self.conn)
@@ -209,6 +278,7 @@ class BacktestLeakageTest(unittest.TestCase):
             "entry_conditions": ["出来高増加を確認します。"],
             "exit_conditions": ["収益性の悪化が確認された場合は撤退します。"],
             "risk_notes": ["外部環境の変化に注意します。"],
+            "used_signal_ids": [],
         }
         cur = self.conn.execute(
             """
@@ -228,6 +298,23 @@ class BacktestLeakageTest(unittest.TestCase):
         self.assertGreater(context["card_counts"].get("fundamental", 0), 0)
         self.assertGreater(len(context["context_packet"]["signal_cards"]), 0)
         self.assertGreater(len(context["source_items"]["news_digest_items"]), 0)
+
+    def test_run_judgement_persists_context_packet_and_signal_cards(self) -> None:
+        self._seed_prompt()
+        self._seed_context()
+        refresh_information_dates(self.conn)
+
+        saved = run_short_term_judgement(self.conn, "7203", provider_name="mock")
+
+        self.assertIsNotNone(saved["context_packet_id"])
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS c FROM signal_cards WHERE context_packet_id = ?",
+            (saved["context_packet_id"],),
+        ).fetchone()["c"]
+        self.assertGreater(count, 0)
+        context = get_judgement_context(self.conn, int(saved["id"]))
+        self.assertTrue(context["loaded_from_context_packet"])
+        self.assertGreater(len(context["context_packet"]["signal_cards"]), 0)
 
     def test_final_judgement_input_contains_context_packet_only(self) -> None:
         self._seed_context()
@@ -355,6 +442,32 @@ class BacktestLeakageTest(unittest.TestCase):
         self.assertIn("未入力の業績修正", issues)
         self.assertEqual(_grounding_issues(repaired, context_packet), [])
 
+    def test_grounding_requires_used_signal_ids_from_context_packet(self) -> None:
+        context_packet = {
+            "data_status": {"missing_data": []},
+            "signal_cards": [{"signal_id": "sig_1", "source_type": "news", "summary": "保存済み材料です。"}],
+        }
+        output = {
+            "judgement_type": "mid_long_term",
+            "action": "WATCH_BUY",
+            "confidence": 0.5,
+            "time_horizon": "3_months_to_1_year",
+            "summary": "保存済み材料を根拠に監視します。",
+            "positive_factors": ["保存済み材料を確認します。"],
+            "negative_factors": ["価格確認はまだ必要です。"],
+            "entry_conditions": ["価格確認後に判断します。"],
+            "exit_conditions": ["材料悪化で撤退します。"],
+            "risk_notes": ["入力にない事実は使いません。"],
+            "used_signal_ids": [],
+        }
+
+        issues = _grounding_issues(output, context_packet)
+        repaired = _repair_grounding_output(output, issues, context_packet)
+
+        self.assertIn("used_signal_idsの空欄", issues)
+        self.assertEqual(repaired["used_signal_ids"], ["sig_1"])
+        self.assertEqual(_grounding_issues(repaired, context_packet), [])
+
     def test_company_news_profile_keeps_related_material_news(self) -> None:
         company = {"id": 1, "security_code": "7011", "name": "三菱重工業", "industry": "機械"}
         profile = fallback_company_news_profile(company)
@@ -459,35 +572,20 @@ class BacktestLeakageTest(unittest.TestCase):
             VALUES (1, 'test', '2026-01-11', 'Q4', '2026-03-01', 'future financials', '{}', '2026-01-11', '2026-01-11')
             """
         )
-        self.conn.execute(
-            """
-            INSERT INTO news_articles
-                (company_id, title, published_at, source, provider, url, summary, created_at, updated_at)
-            VALUES
-                (1, 'past news 上方修正', '2026-01-10', 'test', 'test', 'https://example.test/past-news', '', '2026-01-10', '2026-01-10'),
-                (1, 'future news', '2026-01-11', 'test', 'test', 'https://example.test/future-news', '', '2026-01-11', '2026-01-11'),
-                (1, 'url dated news', NULL, 'test', 'test', 'https://example.test/news/20260109/url-dated-news', '', '2026-01-12', '2026-01-12'),
-                (1, 'future url dated news', NULL, 'test', 'test', 'https://example.test/news/20260111/future-url-dated-news', '', '2026-01-12', '2026-01-12')
-            """
+        self._insert_event("company_news", "past news 上方修正", "2026-01-10", "https://example.test/past-news")
+        self._insert_event("company_news", "future news", "2026-01-11", "https://example.test/future-news")
+        self._insert_event("company_news", "url dated news", "2026-01-09", "https://example.test/news/20260109/url-dated-news", published_at=None)
+        self._insert_event(
+            "company_news",
+            "future url dated news",
+            "2026-01-11",
+            "https://example.test/news/20260111/future-url-dated-news",
+            published_at=None,
         )
-        self.conn.execute(
-            """
-            INSERT INTO disclosures
-                (company_id, title, document_type, published_at, source, url, summary, importance_score, created_at, updated_at)
-            VALUES
-                (1, 'past disclosure 決算短信', 'tdnet', '2026-01-10', 'test', 'https://example.test/past-disclosure', '', 0.5, '2026-01-10', '2026-01-10'),
-                (1, 'future disclosure 決算短信', 'tdnet', '2026-01-11', 'test', 'https://example.test/future-disclosure', '', 0.5, '2026-01-11', '2026-01-11')
-            """
-        )
-        self.conn.execute(
-            """
-            INSERT INTO global_news
-                (category, title, published_at, source, provider, url, summary, created_at, updated_at)
-            VALUES
-                ('policy', 'past factor', '2026-01-10', 'test', 'test', 'https://example.test/past-factor', '', '2026-01-10', '2026-01-10'),
-                ('policy', 'future factor', '2026-01-11', 'test', 'test', 'https://example.test/future-factor', '', '2026-01-11', '2026-01-11')
-            """
-        )
+        self._insert_event("disclosure", "past disclosure 決算短信", "2026-01-10", "https://example.test/past-disclosure")
+        self._insert_event("disclosure", "future disclosure 決算短信", "2026-01-11", "https://example.test/future-disclosure")
+        self._insert_event("global_news", "past factor", "2026-01-10", "https://example.test/past-factor")
+        self._insert_event("global_news", "future factor", "2026-01-11", "https://example.test/future-factor")
 
     def _insert_price(self, price_date: str, open_: float, high: float, low: float, close: float) -> None:
         self.conn.execute(
@@ -526,6 +624,59 @@ class BacktestLeakageTest(unittest.TestCase):
             """,
             (indicator_date, json.dumps(features), indicator_date, indicator_date),
         )
+
+    def _insert_event(
+        self,
+        event_type: str,
+        title: str,
+        information_date: str,
+        url: str,
+        *,
+        published_at: str | None = None,
+        action: str | None = None,
+        relevance_score: float = 0.8,
+    ) -> None:
+        scope = "global" if event_type == "global_news" else "company"
+        metadata = {
+            "category": "policy" if event_type == "global_news" else None,
+            "document_type": "earnings_release" if event_type == "disclosure" else None,
+            "importance_score": 0.5 if event_type == "disclosure" else None,
+            "relevance_score": 0.8,
+            "selection_reason": "test",
+        }
+        event = upsert_source_event(
+            self.conn,
+            scope=scope,
+            event_type=event_type,
+            company_id=1 if scope == "company" else None,
+            title=title,
+            information_date=information_date,
+            published_at=published_at if published_at is not None else information_date,
+            source="test",
+            provider="test",
+            url=url,
+            metadata={key: value for key, value in metadata.items() if value is not None},
+        )
+        record_event_triage(
+            self.conn,
+            source_event_id=int(event["id"]),
+            company_id=1 if scope == "company" else None,
+            action=action or ("must_include" if event_type == "disclosure" else "summarize"),
+            relevance_score=relevance_score,
+            materiality_score=relevance_score,
+            reason="test",
+            model_name="test",
+            prompt_version="test",
+        )
+        if event_type in {"company_news", "global_news"}:
+            upsert_event_summary(
+                self.conn,
+                source_event_id=int(event["id"]),
+                company_id=1 if scope == "company" else None,
+                summary_text=f"分類: 不明 要約: {title} 材料性: 中立 根拠: タイトルのみ",
+                summary_type="test",
+                model_name="test",
+            )
 
 
 if __name__ == "__main__":
